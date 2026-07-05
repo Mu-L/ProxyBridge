@@ -1,31 +1,22 @@
 import Foundation
 import AppKit
 
-struct GitHubRelease: Codable {
-    let tagName: String
-    let name: String
-    let prerelease: Bool
-    let publishedAt: String
-    let assets: [GitHubAsset]
-
-    enum CodingKeys: String, CodingKey {
-        case tagName = "tag_name"
-        case name
-        case prerelease
-        case publishedAt = "published_at"
-        case assets
-    }
+// the update manifest served at download.interceptsuite.com, one entry per platform
+struct UpdateManifest: Codable {
+    let macos: PlatformRelease
 }
 
-struct GitHubAsset: Codable {
-    let name: String
-    let browserDownloadUrl: String
-    let size: Int64
+struct PlatformRelease: Codable {
+    let version: String
+    let releaseDate: String
+    let download: String
+    let releaseNotes: String
 
     enum CodingKeys: String, CodingKey {
-        case name
-        case browserDownloadUrl = "browser_download_url"
-        case size
+        case version
+        case releaseDate = "release_date"
+        case download
+        case releaseNotes = "release_notes"
     }
 }
 
@@ -35,43 +26,39 @@ struct VersionInfo {
     let isUpdateAvailable: Bool
     let downloadUrl: String?
     let fileName: String?
+    let releaseNotesUrl: String?
     let error: String?
 }
 
 class UpdateService {
-    private let githubApiUrl = "https://api.github.com/repos/InterceptSuite/ProxyBridge/releases/latest"
+    private let manifestUrl = "https://download.interceptsuite.com/proxybridge.json"
 
     func checkForUpdates() async -> VersionInfo {
         do {
-            guard let url = URL(string: githubApiUrl) else {
-                return errorVersion("Invalid API URL")
+            guard let url = URL(string: manifestUrl) else {
+                return errorVersion("Invalid update URL")
             }
 
             var request = URLRequest(url: url)
             request.setValue("ProxyBridge-UpdateChecker", forHTTPHeaderField: "User-Agent")
+            request.cachePolicy = .reloadIgnoringLocalCacheData
 
             let (data, _) = try await URLSession.shared.data(for: request)
-            let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+            let manifest = try JSONDecoder().decode(UpdateManifest.self, from: data)
 
+            let mac = manifest.macos
             let currentVersion = getCurrentVersion()
-            let latestVersion = parseVersion(release.tagName)
-
-            // Find the PKG installer in assets
-            let pkgAsset = release.assets.first { asset in
-                asset.name.lowercased().hasSuffix(".pkg") &&
-                (asset.name.lowercased().contains("proxybridge") ||
-                 asset.name.lowercased().contains("installer"))
-            }
-
-            // a macOS pkg installer in the release is valid update
-            let isUpdateAvailable = isNewerVersion(latestVersion, currentVersion) && pkgAsset != nil
+            let fileName = URL(string: mac.download)?.lastPathComponent ?? "ProxyBridge-Installer.pkg"
+            let isUpdateAvailable = isNewerVersion(mac.version, currentVersion)
+                && mac.download.lowercased().hasSuffix(".pkg")
 
             return VersionInfo(
                 currentVersion: currentVersion,
-                latestVersion: release.tagName,
+                latestVersion: "v\(mac.version)",
                 isUpdateAvailable: isUpdateAvailable,
-                downloadUrl: pkgAsset?.browserDownloadUrl,
-                fileName: pkgAsset?.name,
+                downloadUrl: mac.download,
+                fileName: fileName,
+                releaseNotesUrl: mac.releaseNotes,
                 error: nil
             )
         } catch {
@@ -95,23 +82,41 @@ class UpdateService {
         let tempDir = FileManager.default.temporaryDirectory
         let fileURL = tempDir.appendingPathComponent(fileName)
 
-        // Remove existing file if any
         try? FileManager.default.removeItem(at: fileURL)
 
         var downloadedBytes: Int64 = 0
-        let data = NSMutableData()
+        var data = Data()
+        if totalBytes > 0 { data.reserveCapacity(Int(totalBytes)) }
+
+        // collect into a buffer and flush in chunks, and only report progress
+        // every ~256kb so we aren't hopping to the main actor for every byte
+        var buffer = [UInt8]()
+        buffer.reserveCapacity(65536)
+        let progressStep: Int64 = 256 * 1024
+        var lastReported: Int64 = 0
 
         for try await byte in asyncBytes {
-            var byteValue = byte
-            data.append(&byteValue, length: 1)
+            buffer.append(byte)
             downloadedBytes += 1
 
-            if totalBytes > 0 {
-                let progressValue = Double(downloadedBytes) / Double(totalBytes)
-                await MainActor.run {
-                    progress(progressValue)
-                }
+            if buffer.count >= 65536 {
+                data.append(contentsOf: buffer)
+                buffer.removeAll(keepingCapacity: true)
             }
+
+            if totalBytes > 0, downloadedBytes - lastReported >= progressStep {
+                lastReported = downloadedBytes
+                let progressValue = Double(downloadedBytes) / Double(totalBytes)
+                await MainActor.run { progress(progressValue) }
+            }
+        }
+
+        if !buffer.isEmpty {
+            data.append(contentsOf: buffer)
+        }
+
+        if totalBytes > 0 {
+            await MainActor.run { progress(1.0) }
         }
 
         try data.write(to: fileURL)
@@ -119,10 +124,8 @@ class UpdateService {
     }
 
     func installUpdateAndQuit(installerPath: URL) {
-        // Open the PKG installer
         NSWorkspace.shared.open(installerPath)
-
-        // Give the installer a moment to start, then quit
+        // let the installer come up before we quit
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             NSApplication.shared.terminate(nil)
         }
@@ -133,10 +136,6 @@ class UpdateService {
             return "v\(version)"
         }
         return "v3.1"
-    }
-
-    private func parseVersion(_ tagName: String) -> String {
-        return tagName.hasPrefix("v") ? String(tagName.dropFirst()) : tagName
     }
 
     private func isNewerVersion(_ latest: String, _ current: String) -> Bool {
@@ -162,6 +161,7 @@ class UpdateService {
             isUpdateAvailable: false,
             downloadUrl: nil,
             fileName: nil,
+            releaseNotesUrl: nil,
             error: message
         )
     }

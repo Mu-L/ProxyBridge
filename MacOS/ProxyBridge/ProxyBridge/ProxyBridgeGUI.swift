@@ -1,13 +1,42 @@
 import SwiftUI
+import UniformTypeIdentifiers
+import ServiceManagement
+
+// launch-at-login. the desired state lives in the "runAtStartup" working key so
+// it can be part of a profile, and applyToSystem keeps the real login item in sync
+enum LoginItem {
+    static var isEnabled: Bool { UserDefaults.standard.bool(forKey: "runAtStartup") }
+
+    static func setEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: "runAtStartup")
+        applyToSystem(enabled)
+    }
+
+    static func applyToSystem(_ enabled: Bool) {
+        guard #available(macOS 13.0, *) else { return }
+        do {
+            if enabled, SMAppService.mainApp.status != .enabled {
+                try SMAppService.mainApp.register()
+            } else if !enabled, SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            // registration can fail if the app isn't in /Applications, ignore
+        }
+    }
+}
 
 @main
 struct ProxyBridgeGUIApp: App {
     @StateObject private var viewModel = ProxyBridgeViewModel()
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    
+    // when on, closing the window hides the app to the menu bar instead of quitting
+    @AppStorage("closeToMenuBar") private var closeToMenuBar = false
+
     var body: some Scene {
         WindowGroup {
             ContentView(viewModel: viewModel)
+                .background(WindowAccessor())
                 .onAppear {
                     AppDelegate.viewModel = viewModel
                     checkForUpdatesOnStartup()
@@ -35,14 +64,70 @@ struct ProxyBridgeGUIApp: App {
                     set: { _ in viewModel.toggleTrafficLogging() }
                 ))
             }
-            
+
+            CommandMenu("Profile") {
+                ForEach(viewModel.profiles, id: \.self) { name in
+                    Button(action: { viewModel.switchProfile(to: name) }) {
+                        // checkmark marks the active profile
+                        if name == viewModel.activeProfile {
+                            Label(name, systemImage: "checkmark")
+                        } else {
+                            Text(name)
+                        }
+                    }
+                }
+
+                Divider()
+
+                Button("New Profile...") {
+                    promptProfileName(title: "New Profile", message: "Enter a name for the new profile.") {
+                        viewModel.createProfile($0)
+                    }
+                }
+
+                Button("Rename \"\(viewModel.activeProfile)\"...") {
+                    promptProfileName(title: "Rename Profile", message: "Enter a new name.", defaultText: viewModel.activeProfile) {
+                        viewModel.renameProfile(viewModel.activeProfile, to: $0)
+                    }
+                }
+
+                Button("Delete \"\(viewModel.activeProfile)\"") {
+                    viewModel.deleteProfile(viewModel.activeProfile)
+                }
+                .disabled(viewModel.profiles.count <= 1)
+
+                Divider()
+
+                Button("Export \"\(viewModel.activeProfile)\"...") {
+                    exportActiveProfile()
+                }
+
+                Button("Import Profile...") {
+                    importProfileFromFile()
+                }
+            }
+
+            CommandMenu("Settings") {
+                Toggle("Close to Menu Bar", isOn: $closeToMenuBar)
+                Toggle("Run at Startup", isOn: Binding(
+                    get: { LoginItem.isEnabled },
+                    set: { LoginItem.setEnabled($0) }
+                ))
+            }
+
             CommandGroup(replacing: .help) {
+                Button("Documentation") {
+                    if let url = URL(string: "https://interceptsuite.com/docs/proxybridge/") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+
                 Button("Check for Updates...") {
                     openUpdateCheckWindow()
                 }
-                
+
                 Divider()
-                
+
                 Button("About ProxyBridge") {
                     openAboutWindow()
                 }
@@ -88,7 +173,52 @@ struct ProxyBridgeGUIApp: App {
     private func openUpdateCheckWindow() {
         NSApp.sendAction(#selector(AppDelegate.openUpdateCheck), to: nil, from: nil)
     }
-    
+
+    private func exportActiveProfile() {
+        let name = viewModel.activeProfile
+        guard let data = viewModel.exportProfileData(name) else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export Profile"
+        panel.nameFieldStringValue = "\(name).pbprofile"
+        if let type = UTType(filenameExtension: "pbprofile") {
+            panel.allowedContentTypes = [type]
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            try? data.write(to: url)
+        }
+    }
+
+    private func importProfileFromFile() {
+        let panel = NSOpenPanel()
+        panel.title = "Import Profile"
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        var types: [UTType] = [.json]
+        if let pb = UTType(filenameExtension: "pbprofile") { types.insert(pb, at: 0) }
+        panel.allowedContentTypes = types
+        if panel.runModal() == .OK, let url = panel.url, let data = try? Data(contentsOf: url) {
+            viewModel.importProfile(from: data)
+        }
+    }
+
+    // small AppKit text prompt, SwiftUI has no clean text-input alert on macOS
+    private func promptProfileName(title: String, message: String, defaultText: String = "", onSubmit: @escaping (String) -> Void) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.stringValue = defaultText
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            onSubmit(field.stringValue)
+        }
+    }
+
     private func checkForUpdatesOnStartup() {
         let shouldCheck = UserDefaults.standard.object(forKey: "checkForUpdatesOnStartup") as? Bool ?? true
         
@@ -108,19 +238,79 @@ struct ProxyBridgeGUIApp: App {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     static var viewModel: ProxyBridgeViewModel?
     static var pendingUpdateInfo: VersionInfo?
-    
+    static weak var shared: AppDelegate?
+    static weak var mainWindow: NSWindow?
+    // set at launch, tells WindowAccessor to keep the first window hidden
+    static var startHidden = false
+
+    private var statusItem: NSStatusItem?
+
+    private var closeToMenuBar: Bool { UserDefaults.standard.bool(forKey: "closeToMenuBar") }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self
+        setupStatusItem()
+        // keep the real login item in sync with the active profile's setting
+        LoginItem.applyToSystem(LoginItem.isEnabled)
+
+        // a login-item / resume launch is not a "default" launch. if we got here
+        // that way and startup is enabled, come up in the menu bar with no window
+        let isDefaultLaunch = notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool ?? true
+        if !isDefaultLaunch && LoginItem.isEnabled {
+            AppDelegate.startHidden = true
+            NSApp.setActivationPolicy(.accessory)
+        }
+    }
+
+    // if close-to-menu-bar is off, quitting on last window close matches the
+    // windows "close = exit" behavior. when on, the window only hides so this
+    // never fires.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return !closeToMenuBar
+    }
+
+    // the window's close button, hide to the menu bar instead of closing when enabled
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard closeToMenuBar else { return true }
+        sender.orderOut(nil)
+        NSApp.setActivationPolicy(.accessory)  // drop the dock icon, live in the menu bar
+        return false
+    }
+
+    private func setupStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = NSImage(systemSymbolName: "network", accessibilityDescription: "ProxyBridge")
+
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Open ProxyBridge", action: #selector(showMainWindow), keyEquivalent: ""))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit ProxyBridge", action: #selector(quitApp), keyEquivalent: "q"))
+        item.menu = menu
+        statusItem = item
+    }
+
+    @objc private func showMainWindow() {
+        NSApp.setActivationPolicy(.regular)
+        AppDelegate.mainWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // Clear extension memory before app quits
         AppDelegate.viewModel?.stopProxy()
-        
+
         // Give time for memory clearing to complete
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             NSApp.reply(toApplicationShouldTerminate: true)
         }
-        
+
         return .terminateLater
     }
     
@@ -175,5 +365,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             window.makeKeyAndOrderFront(nil)
         }
     }
+}
+
+// grabs the main SwiftUI window so the app delegate can intercept its close
+struct WindowAccessor: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            guard let window = view.window else { return }
+            AppDelegate.mainWindow = window
+            window.delegate = AppDelegate.shared
+            // launched at login, keep it hidden in the menu bar
+            if AppDelegate.startHidden {
+                AppDelegate.startHidden = false
+                window.orderOut(nil)
+            }
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
