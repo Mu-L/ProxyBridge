@@ -1,5 +1,4 @@
 import SwiftUI
-import Darwin
 
 struct ProxySettingsView: View {
     @ObservedObject var viewModel: ProxyBridgeViewModel
@@ -8,8 +7,8 @@ struct ProxySettingsView: View {
     @State private var showAddProxy = false
     @State private var editingConfig: ProxyBridgeViewModel.ProxyConfig?
     @State private var deletingConfig: ProxyBridgeViewModel.ProxyConfig?
+    @State private var checkingConfig: ProxyBridgeViewModel.ProxyConfig?
     @State private var affectedRulesCount = 0
-    @State private var testResults: [String: String] = [:]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -19,7 +18,7 @@ struct ProxySettingsView: View {
             Divider()
             footerButtons
         }
-        .frame(minWidth: 760, idealWidth: 760, maxWidth: .infinity, minHeight: 440, idealHeight: 480, maxHeight: .infinity)
+        .frame(minWidth: 880, idealWidth: 880, maxWidth: .infinity, minHeight: 440, idealHeight: 480, maxHeight: .infinity)
         .alert("Delete Proxy?", isPresented: Binding(
             get: { deletingConfig != nil },
             set: { if !$0 { deletingConfig = nil } }
@@ -31,7 +30,7 @@ struct ProxySettingsView: View {
             Button("Cancel", role: .cancel) { deletingConfig = nil }
         } message: {
             if affectedRulesCount > 0 {
-                Text("\(affectedRulesCount) rule\(affectedRulesCount == 1 ? "" : "s") use this proxy and will be set to Direct.")
+                Text(verbatim: "\(affectedRulesCount) rule\(affectedRulesCount == 1 ? "" : "s") use this proxy and will be set to Direct.")
             } else {
                 Text("This proxy will be permanently removed.")
             }
@@ -41,6 +40,9 @@ struct ProxySettingsView: View {
         }
         .sheet(item: $editingConfig) { config in
             ProxyConfigEditorView(viewModel: viewModel, existing: config)
+        }
+        .sheet(item: $checkingConfig) { config in
+            ProxyCheckerView(config: config)
         }
     }
 
@@ -85,6 +87,12 @@ struct ProxySettingsView: View {
             Spacer()
         } else {
             Table(viewModel.proxyConfigs) {
+                TableColumn("Name") { config in
+                    Text(config.name.isEmpty ? "=" : config.name)
+                        .foregroundColor(config.name.isEmpty ? .secondary : .primary)
+                }
+                .width(140)
+
                 TableColumn("Type") { config in
                     Text(config.type.uppercased())
                         .foregroundColor(typeColor(config.type))
@@ -93,7 +101,9 @@ struct ProxySettingsView: View {
                 .width(70)
 
                 TableColumn("Server") { config in
-                    Text("\(config.host):\(config.port)")
+                    // build the string first, interpolating an Int into a Text
+                    // literal would add a locale grouping separator (1,080)
+                    Text(verbatim: "\(config.host):\(String(config.port))")
                         .fontDesign(.monospaced)
                 }
                 .width(min: 180, ideal: 220, max: .infinity)
@@ -108,19 +118,12 @@ struct ProxySettingsView: View {
                 .width(40)
 
                 TableColumn("Test") { config in
-                    HStack(spacing: 6) {
-                        Button(action: { testConnection(config) }) {
-                            Label("Test", systemImage: "link")
-                        }
-                        .buttonStyle(.borderless)
-                        if let result = testResults[config.id] {
-                            Text(result)
-                                .font(.caption2)
-                                .foregroundColor(result == "OK" ? .green : .red)
-                        }
+                    Button(action: { checkingConfig = config }) {
+                        Label("Test", systemImage: "bolt.horizontal")
                     }
+                    .buttonStyle(.borderless)
                 }
-                .width(min: 80, ideal: 100)
+                .width(min: 60, ideal: 80)
 
                 TableColumn("") { config in
                     HStack(spacing: 12) {
@@ -164,33 +167,6 @@ struct ProxySettingsView: View {
     private func typeColor(_ type: String) -> Color {
         type.lowercased() == "socks5" ? .cyan : .orange
     }
-
-    private func testConnection(_ config: ProxyBridgeViewModel.ProxyConfig) {
-        testResults[config.id] = "..."
-        DispatchQueue.global().async {
-            let result = checkTCPReachability(host: config.host, port: config.port)
-            DispatchQueue.main.async {
-                testResults[config.id] = result ? "OK" : "FAIL"
-            }
-        }
-    }
-
-    private func checkTCPReachability(host: String, port: Int) -> Bool {
-        let sock = socket(AF_INET, SOCK_STREAM, 0)
-        guard sock >= 0 else { return false }
-        defer { Darwin.close(sock) }
-
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(port).bigEndian
-        inet_pton(AF_INET, host, &addr.sin_addr)
-
-        return withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-                connect(sock, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
-            }
-        }
-    }
 }
 
 struct ProxyConfigEditorView: View {
@@ -198,6 +174,7 @@ struct ProxyConfigEditorView: View {
     var existing: ProxyBridgeViewModel.ProxyConfig?
     @Environment(\.dismiss) private var dismiss
 
+    @State private var configName = ""
     @State private var proxyType = "socks5"
     @State private var proxyHost = ""
     @State private var proxyPort = ""
@@ -228,6 +205,8 @@ struct ProxyConfigEditorView: View {
 
             Form {
                 Section {
+                    formTextField(label: "Name", placeholder: "Optional, e.g. Home SOCKS", text: $configName)
+
                     VStack(alignment: .leading, spacing: 8) {
                         HStack { Text("Proxy Type").fontWeight(.medium); Text("*").foregroundColor(.red) }
                         Picker("Select proxy type", selection: $proxyType) {
@@ -278,6 +257,7 @@ struct ProxyConfigEditorView: View {
         .frame(width: 500, height: 520)
         .onAppear {
             if let e = existing {
+                configName = e.name
                 proxyType = e.type
                 proxyHost = e.host
                 proxyPort = String(e.port)
@@ -331,6 +311,7 @@ struct ProxyConfigEditorView: View {
         guard let port = Int(proxyPort) else { return }
         let config = ProxyBridgeViewModel.ProxyConfig(
             id: existing?.id ?? UUID().uuidString,
+            name: configName.trimmingCharacters(in: .whitespaces),
             type: proxyType,
             host: proxyHost,
             port: port,

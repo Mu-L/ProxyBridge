@@ -2,6 +2,7 @@ import Foundation
 import NetworkExtension
 import SystemExtensions
 import Combine
+import AppKit
 
 class ProxyBridgeViewModel: NSObject, ObservableObject {
     @Published var connections: [ConnectionLog] = []
@@ -12,40 +13,56 @@ class ProxyBridgeViewModel: NSObject, ObservableObject {
     var tunnelSession: NETunnelProviderSession?
     private var logTimer: Timer?
     @Published private(set) var proxyConfigs: [ProxyConfig] = []
+    @Published private(set) var profiles: [String] = []
+    @Published private(set) var activeProfile: String = "Default"
     
-    private let maxLogEntries = 1000
-    // trim to 80% when limit hit to avoid trimming on each entry
-    private let trimToEntries = 800
+    private let maxLogEntries = 500
+    // trim back to this when the cap is hit, so we don't shift on every entry
+    private let trimToEntries = 400
     private let logPollingInterval = 1.0
     private let extensionIdentifier = "com.interceptsuite.ProxyBridge.extension"
-    // reuse formatter
-    // saves memory about 2% and speed up the ui
     private let timestampFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
         return f
     }()
-    // removed uuid and use int - memory usage and speed improved due to size
     private var connectionIdCounter: Int = 0
     private var activityIdCounter: Int = 0
     
     struct ProxyConfig: Identifiable, Codable {
         let id: String
+        var name: String
         let type: String
         let host: String
         let port: Int
         let username: String?
         let password: String?
 
-        var displayName: String { "\(type.uppercased()) \(host):\(port)" }
+        // name is optional, show type and host:port either way
+        var displayName: String {
+            let server = "\(type.uppercased()) \(host):\(port)"
+            return name.isEmpty ? server : "\(name) = \(server)"
+        }
 
-        init(id: String = UUID().uuidString, type: String, host: String, port: Int, username: String?, password: String?) {
+        init(id: String = UUID().uuidString, name: String = "", type: String, host: String, port: Int, username: String?, password: String?) {
             self.id = id
+            self.name = name
             self.type = type
             self.host = host
             self.port = port
             self.username = username
             self.password = password
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.id = try c.decode(String.self, forKey: .id)
+            self.name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+            self.type = try c.decode(String.self, forKey: .type)
+            self.host = try c.decode(String.self, forKey: .host)
+            self.port = try c.decode(Int.self, forKey: .port)
+            self.username = try c.decodeIfPresent(String.self, forKey: .username)
+            self.password = try c.decodeIfPresent(String.self, forKey: .password)
         }
     }
     
@@ -66,11 +83,46 @@ class ProxyBridgeViewModel: NSObject, ObservableObject {
         let message: String
     }
     
+    // when every window is hidden or minimized there's no point polling logs
+    private var isWindowVisible = true
+
     override init() {
         super.init()
+        // both arrays are capped at maxLogEntries, reserve up front so a busy
+        // session doesn't keep reallocating the backing storage as it fills
+        connections.reserveCapacity(maxLogEntries)
+        activityLogs.reserveCapacity(maxLogEntries)
         loadTrafficLoggingSetting()
+        loadProfiles()
         loadProxyConfig()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(occlusionChanged),
+            name: NSApplication.didChangeOcclusionStateNotification,
+            object: nil
+        )
         installAndStartProxy()
+    }
+
+    @objc private func occlusionChanged() {
+        isWindowVisible = NSApp.occlusionState.contains(.visible)
+        updatePollingState()
+    }
+
+    // single place that decides whether the poll timer should be running
+    private func updatePollingState() {
+        if isTrafficLoggingEnabled && tunnelSession != nil && isWindowVisible {
+            startLogPollingTimer()
+        } else {
+            stopLogPollingTimer()
+        }
+    }
+
+    private func stopLogPollingTimer() {
+        DispatchQueue.main.async { [weak self] in
+            self?.logTimer?.invalidate()
+            self?.logTimer = nil
+        }
     }
     
     private func loadTrafficLoggingSetting() {
@@ -81,13 +133,7 @@ class ProxyBridgeViewModel: NSObject, ObservableObject {
         isTrafficLoggingEnabled.toggle()
         UserDefaults.standard.set(isTrafficLoggingEnabled, forKey: "trafficLoggingEnabled")
         sendTrafficLoggingToExtension(isTrafficLoggingEnabled)
-        
-        if isTrafficLoggingEnabled {
-            startLogPollingTimer()
-        } else {
-            logTimer?.invalidate()
-            logTimer = nil
-        }
+        updatePollingState()
     }
     
     private func sendTrafficLoggingToExtension(_ enabled: Bool) {
@@ -107,7 +153,190 @@ class ProxyBridgeViewModel: NSObject, ObservableObject {
         if let data = UserDefaults.standard.data(forKey: "proxyConfigs"),
            let configs = try? JSONDecoder().decode([ProxyConfig].self, from: data) {
             proxyConfigs = configs
+        } else {
+            proxyConfigs = []
         }
+    }
+
+    // MARK: - Profiles
+    //
+    // a profile bundles the proxy configs + rules. the live "proxyConfigs" and
+    // "proxyRules" UserDefaults keys always hold the active profile so the rest
+    // of the app and the extension keep reading them unchanged. switching just
+    // snapshots the current profile and swaps in another one's data.
+
+    private func profileConfigsKey(_ name: String) -> String { "profile.\(name).proxyConfigs" }
+    private func profileRulesKey(_ name: String) -> String { "profile.\(name).proxyRules" }
+    private func profileLoggingKey(_ name: String) -> String { "profile.\(name).trafficLoggingEnabled" }
+    private func profileCloseKey(_ name: String) -> String { "profile.\(name).closeToMenuBar" }
+    private func profileStartupKey(_ name: String) -> String { "profile.\(name).runAtStartup" }
+
+    private func loadProfiles() {
+        let d = UserDefaults.standard
+        var names = d.stringArray(forKey: "profiles") ?? []
+        if names.isEmpty {
+            // first run, seed a Default profile from whatever is already stored
+            names = ["Default"]
+            d.set(names, forKey: "profiles")
+            d.set("Default", forKey: "activeProfile")
+            flushWorkingSet(to: "Default")
+        }
+        profiles = names
+        activeProfile = d.string(forKey: "activeProfile") ?? names.first ?? "Default"
+    }
+
+    // copy the live working keys into a profile's snapshot
+    private func flushWorkingSet(to name: String) {
+        let d = UserDefaults.standard
+        d.set(d.data(forKey: "proxyConfigs"), forKey: profileConfigsKey(name))
+        d.set(d.array(forKey: "proxyRules"), forKey: profileRulesKey(name))
+        d.set(isTrafficLoggingEnabled, forKey: profileLoggingKey(name))
+        d.set(d.bool(forKey: "closeToMenuBar"), forKey: profileCloseKey(name))
+        d.set(d.bool(forKey: "runAtStartup"), forKey: profileStartupKey(name))
+    }
+
+    // load a profile's snapshot into the live working keys
+    private func loadWorkingSet(from name: String) {
+        let d = UserDefaults.standard
+        if let data = d.data(forKey: profileConfigsKey(name)) {
+            d.set(data, forKey: "proxyConfigs")
+        } else {
+            d.removeObject(forKey: "proxyConfigs")
+        }
+        d.set(d.array(forKey: profileRulesKey(name)) ?? [], forKey: "proxyRules")
+        // traffic logging is per profile, default on when the snapshot has none
+        d.set(d.object(forKey: profileLoggingKey(name)) as? Bool ?? true, forKey: "trafficLoggingEnabled")
+        // window + startup behaviour are per profile too, default off
+        d.set(d.object(forKey: profileCloseKey(name)) as? Bool ?? false, forKey: "closeToMenuBar")
+        d.set(d.object(forKey: profileStartupKey(name)) as? Bool ?? false, forKey: "runAtStartup")
+    }
+
+    // reload in-memory state from the working keys and push it to the extension
+    private func applyActiveProfile() {
+        loadProxyConfig()
+        loadTrafficLoggingSetting()
+        // window-close behaviour is read live from the key, only startup needs applying
+        LoginItem.applyToSystem(UserDefaults.standard.bool(forKey: "runAtStartup"))
+        if let session = tunnelSession {
+            sendProxyConfigsToExtension(session: session)
+            RuleManager.resyncRules(session: session) { _, _ in }
+            sendTrafficLoggingToExtension(isTrafficLoggingEnabled)
+        }
+        updatePollingState()
+    }
+
+    func switchProfile(to name: String) {
+        guard name != activeProfile, profiles.contains(name) else { return }
+        flushWorkingSet(to: activeProfile)
+        loadWorkingSet(from: name)
+        activeProfile = name
+        UserDefaults.standard.set(name, forKey: "activeProfile")
+        applyActiveProfile()
+    }
+
+    func createProfile(_ rawName: String) {
+        let name = rawName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, !profiles.contains(name) else { return }
+        // new profiles start empty
+        UserDefaults.standard.removeObject(forKey: profileConfigsKey(name))
+        UserDefaults.standard.set([[String: Any]](), forKey: profileRulesKey(name))
+        profiles.append(name)
+        UserDefaults.standard.set(profiles, forKey: "profiles")
+        switchProfile(to: name)
+    }
+
+    func renameProfile(_ old: String, to rawNew: String) {
+        let new = rawNew.trimmingCharacters(in: .whitespaces)
+        guard !new.isEmpty, profiles.contains(old), !profiles.contains(new) else { return }
+        let d = UserDefaults.standard
+        // make sure the active profile's snapshot is current before moving it
+        if old == activeProfile { flushWorkingSet(to: old) }
+        d.set(d.data(forKey: profileConfigsKey(old)), forKey: profileConfigsKey(new))
+        d.set(d.array(forKey: profileRulesKey(old)), forKey: profileRulesKey(new))
+        d.set(d.object(forKey: profileLoggingKey(old)), forKey: profileLoggingKey(new))
+        d.set(d.object(forKey: profileCloseKey(old)), forKey: profileCloseKey(new))
+        d.set(d.object(forKey: profileStartupKey(old)), forKey: profileStartupKey(new))
+        d.removeObject(forKey: profileConfigsKey(old))
+        d.removeObject(forKey: profileRulesKey(old))
+        d.removeObject(forKey: profileLoggingKey(old))
+        d.removeObject(forKey: profileCloseKey(old))
+        d.removeObject(forKey: profileStartupKey(old))
+        if let i = profiles.firstIndex(of: old) { profiles[i] = new }
+        d.set(profiles, forKey: "profiles")
+        if activeProfile == old {
+            activeProfile = new
+            d.set(new, forKey: "activeProfile")
+        }
+    }
+
+    func deleteProfile(_ name: String) {
+        guard profiles.count > 1, profiles.contains(name) else { return }
+        // can't delete the one we're on, move to another first
+        if name == activeProfile, let other = profiles.first(where: { $0 != name }) {
+            switchProfile(to: other)
+        }
+        let d = UserDefaults.standard
+        d.removeObject(forKey: profileConfigsKey(name))
+        d.removeObject(forKey: profileRulesKey(name))
+        d.removeObject(forKey: profileLoggingKey(name))
+        d.removeObject(forKey: profileCloseKey(name))
+        d.removeObject(forKey: profileStartupKey(name))
+        profiles.removeAll { $0 == name }
+        d.set(profiles, forKey: "profiles")
+    }
+
+    // build a portable .pbprofile json for a profile
+    func exportProfileData(_ name: String) -> Data? {
+        guard profiles.contains(name) else { return nil }
+        // make sure the active profile's snapshot reflects the latest edits
+        if name == activeProfile { flushWorkingSet(to: name) }
+        let d = UserDefaults.standard
+        let configsJSON = d.data(forKey: profileConfigsKey(name))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? []
+        let dict: [String: Any] = [
+            "name": name,
+            "trafficLoggingEnabled": d.object(forKey: profileLoggingKey(name)) as? Bool ?? true,
+            "closeToMenuBar": d.object(forKey: profileCloseKey(name)) as? Bool ?? false,
+            "runAtStartup": d.object(forKey: profileStartupKey(name)) as? Bool ?? false,
+            "proxyConfigs": configsJSON,
+            "proxyRules": d.array(forKey: profileRulesKey(name)) ?? []
+        ]
+        return try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    // create a new profile from a .pbprofile json and switch to it
+    @discardableResult
+    func importProfile(from data: Data) -> Bool {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        var base = (obj["name"] as? String)?.trimmingCharacters(in: .whitespaces) ?? "Imported"
+        if base.isEmpty { base = "Imported" }
+        let name = uniqueProfileName(base)
+
+        let d = UserDefaults.standard
+        // re-encode the configs array back to the Data form we store, ids are kept
+        // so each rule's action still points at the right proxy config
+        if let configsJSON = obj["proxyConfigs"],
+           let configsData = try? JSONSerialization.data(withJSONObject: configsJSON) {
+            d.set(configsData, forKey: profileConfigsKey(name))
+        } else {
+            d.removeObject(forKey: profileConfigsKey(name))
+        }
+        d.set(obj["proxyRules"] as? [[String: Any]] ?? [], forKey: profileRulesKey(name))
+        d.set(obj["trafficLoggingEnabled"] as? Bool ?? true, forKey: profileLoggingKey(name))
+        d.set(obj["closeToMenuBar"] as? Bool ?? false, forKey: profileCloseKey(name))
+        d.set(obj["runAtStartup"] as? Bool ?? false, forKey: profileStartupKey(name))
+
+        profiles.append(name)
+        d.set(profiles, forKey: "profiles")
+        switchProfile(to: name)
+        return true
+    }
+
+    private func uniqueProfileName(_ base: String) -> String {
+        if !profiles.contains(base) { return base }
+        var i = 2
+        while profiles.contains("\(base) (\(i))") { i += 1 }
+        return "\(base) (\(i))"
     }
 
     private func saveProxyConfigs() {
@@ -150,7 +379,7 @@ class ProxyBridgeViewModel: NSObject, ObservableObject {
             if changed {
                 UserDefaults.standard.set(saved, forKey: "proxyRules")
                 if let session = tunnelSession {
-                    RuleManager.loadRulesFromUserDefaults(session: session) { _, _ in }
+                    RuleManager.resyncRules(session: session) { _, _ in }
                 }
             }
         }
@@ -277,7 +506,6 @@ class ProxyBridgeViewModel: NSObject, ObservableObject {
             return
         }
         
-        // Clear all data from extension memory before stopping
         clearExtensionMemory(session: session) { [weak self] in
             guard let self = self else { return }
             
@@ -295,9 +523,8 @@ class ProxyBridgeViewModel: NSObject, ObservableObject {
     }
     
     private func clearExtensionMemory(session: NETunnelProviderSession, completion: @escaping () -> Void) {
-        // clear rules auto fix the #51 - and proxy rules become inactive after It closes
+        // clearing rules fixes #51 where rules stayed active after the app closed
         RuleManager.clearRules(session: session) { success, message in
-            //clear proxy config as well keep meory usage low for extesion 
             let clearConfigMessage: [String: Any] = [
                 "action": "clearConfig"
             ]
@@ -315,18 +542,15 @@ class ProxyBridgeViewModel: NSObject, ObservableObject {
     
     private func setupLogPolling(session: NETunnelProviderSession) {
         tunnelSession = session
-        
         sendTrafficLoggingToExtension(isTrafficLoggingEnabled)
-        
-        if isTrafficLoggingEnabled {
-            startLogPollingTimer()
-        }
+        updatePollingState()
     }
     
     private func startLogPollingTimer() {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.logTimer?.invalidate()
+            // already running, don't reset the cadence
+            guard self.logTimer == nil else { return }
             self.logTimer = Timer.scheduledTimer(
                 withTimeInterval: self.logPollingInterval,
                 repeats: true
@@ -344,37 +568,59 @@ class ProxyBridgeViewModel: NSObject, ObservableObject {
         
         try? session.sendProviderMessage(data) { [weak self] response in
             guard let self = self,
-                  let responseData = response else {
+                  let responseData = response,
+                  let logs = try? JSONSerialization.jsonObject(with: responseData) as? [[String: String]],
+                  !logs.isEmpty else {
                 return
             }
-            
-            if let logs = try? JSONSerialization.jsonObject(with: responseData) as? [[String: String]] {
-                DispatchQueue.main.async {
-                    for log in logs {
-                        if log["type"] == "connection" {
-                            self.handleConnectionLog(log)
-                        } else {
-                            self.handleActivityLog(log)
-                        }
+
+            // build the batch first, then touch the published arrays once each
+            // so a busy second is one ui update instead of a hundred
+            DispatchQueue.main.async {
+                var newConnections: [ConnectionLog] = []
+                var newActivity: [ActivityLog] = []
+                for log in logs {
+                    if log["type"] == "connection" {
+                        if let c = self.makeConnectionLog(log) { newConnections.append(c) }
+                    } else {
+                        if let a = self.makeActivityLog(log) { newActivity.append(a) }
                     }
                 }
+                self.appendConnections(newConnections)
+                self.appendActivity(newActivity)
             }
         }
     }
-    
-    private func handleConnectionLog(_ log: [String: String]) {
-        guard isTrafficLoggingEnabled else { return }
-        
+
+    private func appendConnections(_ items: [ConnectionLog]) {
+        guard !items.isEmpty else { return }
+        connections.append(contentsOf: items)
+        if connections.count > maxLogEntries {
+            connections.removeFirst(connections.count - trimToEntries)
+        }
+    }
+
+    private func appendActivity(_ items: [ActivityLog]) {
+        guard !items.isEmpty else { return }
+        activityLogs.append(contentsOf: items)
+        if activityLogs.count > maxLogEntries {
+            activityLogs.removeFirst(activityLogs.count - trimToEntries)
+        }
+    }
+
+    private func makeConnectionLog(_ log: [String: String]) -> ConnectionLog? {
+        guard isTrafficLoggingEnabled else { return nil }
+
         guard let proto = log["protocol"],
               let process = log["process"],
               let dest = log["destination"],
               let port = log["port"],
               let proxy = log["proxy"] else {
-            return
+            return nil
         }
-        
+
         connectionIdCounter &+= 1
-        let connectionLog = ConnectionLog(
+        return ConnectionLog(
             id: connectionIdCounter,
             timestamp: getCurrentTimestamp(),
             connectionProtocol: proto,
@@ -383,35 +629,23 @@ class ProxyBridgeViewModel: NSObject, ObservableObject {
             port: port,
             proxy: proxy
         )
-        connections.append(connectionLog)
-        
-        // Trim in bulk to avoid O(n) shift on every entry at the limit
-        if connections.count > maxLogEntries {
-            connections.removeFirst(connections.count - trimToEntries)
-        }
     }
-    
-    private func handleActivityLog(_ log: [String: String]) {
+
+    private func makeActivityLog(_ log: [String: String]) -> ActivityLog? {
         guard let timestamp = log["timestamp"],
               let level = log["level"],
               let message = log["message"] else {
-            return
+            return nil
         }
-        
+
         activityIdCounter &+= 1
-        let activityLog = ActivityLog(
+        return ActivityLog(
             id: activityIdCounter,
             timestamp: timestamp,
             level: level,
             message: message
         )
-        activityLogs.append(activityLog)
-        
-        if activityLogs.count > maxLogEntries {
-            activityLogs.removeFirst(activityLogs.count - trimToEntries)
-        }
     }
-    
 
     func sendProxyConfigsToExtension(session: NETunnelProviderSession) {
         let configsArray: [[String: Any]] = proxyConfigs.map { config in
@@ -457,11 +691,7 @@ class ProxyBridgeViewModel: NSObject, ObservableObject {
             level: level,
             message: message
         )
-        activityLogs.append(log)
-        
-        if activityLogs.count > maxLogEntries {
-            activityLogs.removeFirst(activityLogs.count - trimToEntries)
-        }
+        appendActivity([log])
     }
     
     private func getCurrentTimestamp() -> String {
@@ -469,6 +699,7 @@ class ProxyBridgeViewModel: NSObject, ObservableObject {
     }
     
     deinit {
+        NotificationCenter.default.removeObserver(self)
         logTimer?.invalidate()
         stopProxy()
     }

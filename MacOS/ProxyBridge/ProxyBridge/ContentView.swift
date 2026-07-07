@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct ContentView: View {
     @ObservedObject var viewModel: ProxyBridgeViewModel
@@ -61,23 +62,30 @@ struct ContentView: View {
     }
     
     private var filteredConnections: [ProxyBridgeViewModel.ConnectionLog] {
-        if connectionSearchText.isEmpty {
+        let q = connectionSearchText
+        if q.isEmpty {
             return viewModel.connections
         }
+        // match against every field so a search finds protocol, ip, port, process, proxy or time
         return viewModel.connections.filter {
-            $0.process.localizedCaseInsensitiveContains(connectionSearchText) ||
-            $0.destination.localizedCaseInsensitiveContains(connectionSearchText) ||
-            $0.proxy.localizedCaseInsensitiveContains(connectionSearchText)
+            $0.timestamp.localizedCaseInsensitiveContains(q) ||
+            $0.connectionProtocol.localizedCaseInsensitiveContains(q) ||
+            $0.process.localizedCaseInsensitiveContains(q) ||
+            $0.destination.localizedCaseInsensitiveContains(q) ||
+            $0.port.localizedCaseInsensitiveContains(q) ||
+            $0.proxy.localizedCaseInsensitiveContains(q)
         }
     }
-    
+
     private var filteredActivityLogs: [ProxyBridgeViewModel.ActivityLog] {
-        if activitySearchText.isEmpty {
+        let q = activitySearchText
+        if q.isEmpty {
             return viewModel.activityLogs
         }
         return viewModel.activityLogs.filter {
-            $0.message.localizedCaseInsensitiveContains(activitySearchText) ||
-            $0.level.localizedCaseInsensitiveContains(activitySearchText)
+            $0.timestamp.localizedCaseInsensitiveContains(q) ||
+            $0.level.localizedCaseInsensitiveContains(q) ||
+            $0.message.localizedCaseInsensitiveContains(q)
         }
     }
 }
@@ -108,10 +116,10 @@ struct ConnectionsView: View {
         VStack(spacing: 0) {
             searchBar
             Divider()
-            connectionsList
+            LogTextView(text: connectionsText)
         }
     }
-    
+
     private var searchBar: some View {
         HStack {
             Image(systemName: "magnifyingglass")
@@ -124,50 +132,20 @@ struct ConnectionsView: View {
         .padding()
         .background(Color(NSColor.controlBackgroundColor))
     }
-    
-    private var connectionsList: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 4) {
-                    ForEach(connections) { connection in
-                        connectionRow(connection)
-                            .id(connection.id)
-                    }
-                }
-                .onChange(of: connections.count) { _ in
-                    scrollToLast(proxy: proxy)
-                }
-            }
+
+    private var connectionsText: NSAttributedString {
+        let out = NSMutableAttributedString()
+        for c in connections {
+            out.append(LogText.seg("[\(c.timestamp)] ", .secondaryLabelColor))
+            out.append(LogText.seg("[\(c.connectionProtocol)] ", .systemBlue))
+            out.append(LogText.seg(c.process, .systemGreen))
+            out.append(LogText.seg(" → ", .secondaryLabelColor))
+            out.append(LogText.seg("\(c.destination):\(c.port)", .systemOrange))
+            out.append(LogText.seg(" → ", .secondaryLabelColor))
+            out.append(LogText.seg(c.proxy, c.proxy == "Direct" ? .secondaryLabelColor : .systemPurple))
+            out.append(LogText.seg("\n", .labelColor))
         }
-    }
-    
-    private func connectionRow(_ connection: ProxyBridgeViewModel.ConnectionLog) -> some View {
-        HStack(spacing: 12) {
-            monoText("[\(connection.timestamp)]", color: .gray)
-            monoText("[\(connection.connectionProtocol)]", color: .blue)
-            monoText(connection.process, color: .green)
-            monoText("→", color: .gray)
-            monoText("\(connection.destination):\(connection.port)", color: .orange)
-            monoText("→", color: .gray)
-            monoText(connection.proxy, color: connection.proxy == "Direct" ? .gray : .purple)
-                .fontWeight(.medium)
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 4)
-    }
-    
-    private func monoText(_ text: String, color: Color) -> some View {
-        Text(text)
-            .foregroundColor(color)
-            .font(.system(.body, design: .monospaced))
-    }
-    
-    private func scrollToLast(proxy: ScrollViewProxy) {
-        if let last = connections.last {
-            withAnimation {
-                proxy.scrollTo(last.id, anchor: .bottom)
-            }
-        }
+        return out
     }
 }
 
@@ -180,10 +158,10 @@ struct ActivityLogsView: View {
         VStack(spacing: 0) {
             searchBar
             Divider()
-            logsList
+            LogTextView(text: logsText)
         }
     }
-    
+
     private var searchBar: some View {
         HStack {
             Image(systemName: "magnifyingglass")
@@ -196,44 +174,78 @@ struct ActivityLogsView: View {
         .padding()
         .background(Color(NSColor.controlBackgroundColor))
     }
-    
-    private var logsList: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 4) {
-                    ForEach(logs) { log in
-                        logRow(log)
-                            .id(log.id)
-                    }
-                }
-                .onChange(of: logs.count) { _ in
-                    scrollToLast(proxy: proxy)
-                }
-            }
+
+    private var logsText: NSAttributedString {
+        let out = NSMutableAttributedString()
+        for log in logs {
+            out.append(LogText.seg("[\(log.timestamp)] ", .secondaryLabelColor))
+            out.append(LogText.seg("[\(log.level)] ", log.level == "ERROR" ? .systemRed : .systemBlue))
+            out.append(LogText.seg(log.message, .labelColor))
+            out.append(LogText.seg("\n", .labelColor))
+        }
+        return out
+    }
+}
+
+// builds the colored, monospaced segments shared by both log views
+enum LogText {
+    static let font = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+
+    static func seg(_ string: String, _ color: NSColor) -> NSAttributedString {
+        NSAttributedString(string: string, attributes: [.foregroundColor: color, .font: font])
+    }
+}
+
+// read-only NSTextView so the whole log behaves like a text area, multi-row
+// drag select, select all and copy all work like any text box
+struct LogTextView: NSViewRepresentable {
+    let text: NSAttributedString
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSTextView.scrollableTextView()
+        scrollView.hasVerticalScroller = true
+        scrollView.drawsBackground = false
+
+        if let textView = scrollView.documentView as? NSTextView {
+            textView.isEditable = false
+            textView.isSelectable = true
+            textView.drawsBackground = false
+            textView.textContainerInset = NSSize(width: 8, height: 8)
+            textView.font = LogText.font
+        }
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView,
+              let storage = textView.textStorage else { return }
+
+        // nothing changed, leave the current selection and scroll position alone
+        if storage.string == text.string { return }
+
+        // keep the user's selection if it still fits (holds while not trimming),
+        // otherwise stick to the bottom so new lines stay in view
+        let previousSelection = textView.selectedRanges
+        let wasAtBottom = isScrolledToBottom(scrollView)
+
+        storage.setAttributedString(text)
+
+        let length = (text.string as NSString).length
+        let validSelection = previousSelection.filter { value in
+            let r = value.rangeValue
+            return r.location + r.length <= length
+        }
+
+        if let sel = validSelection.first, sel.rangeValue.length > 0 {
+            textView.selectedRanges = validSelection
+        } else if wasAtBottom {
+            textView.scrollToEndOfDocument(nil)
         }
     }
-    
-    private func logRow(_ log: ProxyBridgeViewModel.ActivityLog) -> some View {
-        HStack(spacing: 12) {
-            monoText("[\(log.timestamp)]", color: .gray)
-            monoText("[\(log.level)]", color: log.level == "ERROR" ? .red : .blue)
-            monoText(log.message, color: .primary)
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 4)
-    }
-    
-    private func monoText(_ text: String, color: Color) -> some View {
-        Text(text)
-            .foregroundColor(color)
-            .font(.system(.body, design: .monospaced))
-    }
-    
-    private func scrollToLast(proxy: ScrollViewProxy) {
-        if let last = logs.last {
-            withAnimation {
-                proxy.scrollTo(last.id, anchor: .bottom)
-            }
-        }
+
+    private func isScrolledToBottom(_ scrollView: NSScrollView) -> Bool {
+        let docHeight = scrollView.documentView?.bounds.height ?? 0
+        let visible = scrollView.contentView.bounds
+        return visible.maxY >= docHeight - 24
     }
 }
